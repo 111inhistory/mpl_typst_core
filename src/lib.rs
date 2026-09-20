@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use typst::Library;
 use typst::LibraryExt;
 use typst::World;
-use typst::diag::{FileError, FileResult, SourceResult};
+use typst::diag::{FileResult, SourceResult};
 use typst::engine::{Engine, Route, Sink, Traced};
 use typst::foundations::{Bytes, Datetime, Duration, StyleChain};
 use typst::introspection::{EmptyIntrospector, Locator};
@@ -163,12 +163,41 @@ const MITEX_PRELUDE: &str = "\
 #let planck = (reduce: symbol(\"ℏ\"))\n\
 ";
 
+/// How the incoming Matplotlib string should be interpreted.
+///
+/// Mirrors Matplotlib's own `Text._preprocess_math` contract so that plain
+/// text never leaks into the math parser.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TextMode {
+    /// `ismath=False`: the whole string is literal text.
+    Plain,
+    /// `ismath=True`: the string may interleave text with `$...$` math.
+    /// A string without any `$` is treated as bare math source.
+    Mixed,
+    /// `ismath="TeX"`: as [`TextMode::Mixed`], except a string without any `$`
+    /// is literal text (Matplotlib probes the renderer with `"lp"`).
+    Tex,
+}
+
+impl TextMode {
+    fn from_py(value: Option<&Bound<'_, PyAny>>) -> Self {
+        let Some(value) = value else {
+            return Self::Plain;
+        };
+        match value.extract::<bool>() {
+            Ok(true) => Self::Mixed,
+            Ok(false) => Self::Plain,
+            Err(_) => Self::Tex,
+        }
+    }
+}
+
 fn strip_mathdefault(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(start) = rest.find(r"\mathdefault{") {
         out.push_str(&rest[..start]);
-        let after = &rest[start + 13..];
+        let after = &rest[start + r"\mathdefault{".len()..];
         if let Some(end) = after.find('}') {
             out.push_str(&after[..end]);
             rest = &after[end + 1..];
@@ -182,56 +211,100 @@ fn strip_mathdefault(s: &str) -> String {
     out
 }
 
-fn convert_latex_math(s: &str) -> String {
-    let stripped = strip_mathdefault(s);
+/// Renders one Matplotlib math fragment as Typst inline math.
+fn convert_latex_math(inner: &str) -> String {
+    let stripped = strip_mathdefault(inner);
     let trimmed = stripped.trim();
-    let inner = if trimmed.starts_with('$') && trimmed.ends_with('$') && trimmed.len() >= 2 {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    };
-    if inner.contains('\\') {
-        if let Ok(converted) = mitex::convert_math(inner, None) {
-            return format!("$ {} $", converted);
+    if trimmed.contains('\\') {
+        if let Ok(converted) = mitex::convert_math(trimmed, None) {
+            return format!("${}$", converted.trim());
         }
     }
-    format!("$ {} $", inner)
+    format!("${trimmed}$")
 }
-fn prepare_typst_body(text: &str, is_math: bool) -> String {
-    if is_math {
-        let trimmed = text.trim();
-        if trimmed.starts_with('$') || trimmed.contains('\\') {
-            convert_latex_math(text)
-        } else {
-            text.to_string()
-        }
-    } else if text.contains('$') {
-        let mut result = String::with_capacity(text.len() + 16);
-        let mut in_math = false;
-        let mut math_buf = String::new();
 
-        for ch in text.chars() {
-            if ch == '$' {
-                if in_math {
-                    result.push_str(&convert_latex_math(&math_buf));
-                    math_buf.clear();
-                    in_math = false;
-                } else {
-                    in_math = true;
-                }
-            } else if in_math {
-                math_buf.push(ch);
-            } else {
-                result.push(ch);
+/// Renders one literal Matplotlib text run as Typst markup.
+///
+/// `\$` denotes a literal dollar sign in Matplotlib; a bare `$` must be
+/// escaped so it cannot open a math scope in Typst.
+fn render_text_run(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut backslashes = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '\\' => {
+                backslashes += 1;
+                continue;
+            }
+            '$' => {
+                // Matplotlib treats both `$` and `\$` as a literal dollar sign
+                // here; Typst needs an explicit escape either way.
+                out.extend(std::iter::repeat_n('\\', backslashes & !1));
+                out.push_str("\\$");
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(ch);
             }
         }
-        if in_math {
-            result.push_str(&convert_latex_math(&math_buf));
-        }
-        result
-    } else {
-        text.to_string()
+        backslashes = 0;
     }
+    out.extend(std::iter::repeat_n('\\', backslashes));
+    out
+}
+
+/// Byte ranges of `$...$` math spans, or `None` when the string has no
+/// unescaped dollar sign, or `Some(&[])` when their count is odd.
+fn math_spans(text: &str) -> Option<Vec<(usize, usize)>> {
+    let mut dollars = Vec::new();
+    let mut backslashes = 0usize;
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '\\' => backslashes += 1,
+            '$' => {
+                if backslashes % 2 == 0 {
+                    dollars.push(idx);
+                }
+                backslashes = 0;
+            }
+            _ => backslashes = 0,
+        }
+    }
+    if dollars.is_empty() {
+        return None;
+    }
+    if dollars.len() % 2 != 0 {
+        return Some(Vec::new());
+    }
+    Some(dollars.chunks_exact(2).map(|pair| (pair[0], pair[1])).collect())
+}
+
+/// Splits a Matplotlib string into Typst markup, converting only the math
+/// spans so that surrounding prose stays literal.
+fn prepare_typst_body(text: &str, mode: TextMode) -> String {
+    if mode == TextMode::Plain {
+        return render_text_run(text);
+    }
+
+    let Some(spans) = math_spans(text) else {
+        return match mode {
+            TextMode::Mixed => convert_latex_math(text),
+            _ => render_text_run(text),
+        };
+    };
+    if spans.is_empty() {
+        return render_text_run(text);
+    }
+
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut cursor = 0;
+    for (open, close) in spans {
+        out.push_str(&render_text_run(&text[cursor..open]));
+        out.push_str(&convert_latex_math(&text[open + 1..close]));
+        cursor = close + 1;
+    }
+    out.push_str(&render_text_run(&text[cursor..]));
+    out
 }
 
 #[pyclass]
@@ -270,7 +343,7 @@ impl TypstCoreMeasurer {
         text,
         font_family=None,
         font_size_pt=7.0,
-        is_math=false,
+        is_math=None,
         top_edge="cap-height",
         bottom_edge="descender",
         par_leading_em=0.65,
@@ -281,7 +354,7 @@ impl TypstCoreMeasurer {
         text: &str,
         font_family: Option<Vec<String>>,
         font_size_pt: f64,
-        is_math: bool,
+        is_math: Option<&Bound<'_, PyAny>>,
         top_edge: &str,
         bottom_edge: &str,
         par_leading_em: f64,
@@ -299,7 +372,7 @@ impl TypstCoreMeasurer {
             _ => "(\"Times New Roman\", \"SimSun\")".to_string(),
         };
 
-        let body = prepare_typst_body(text, is_math);
+        let body = prepare_typst_body(text, TextMode::from_py(is_math));
 
         let top_edge_val = if top_edge.ends_with("pt") || top_edge.ends_with("em") {
             top_edge.to_string()
@@ -328,7 +401,7 @@ impl TypstCoreMeasurer {
         items,
         font_family=None,
         font_size_pt=7.0,
-        is_math=false,
+        is_math=None,
         top_edge="cap-height",
         bottom_edge="descender"
     ))]
@@ -337,7 +410,7 @@ impl TypstCoreMeasurer {
         items: Vec<String>,
         font_family: Option<Vec<String>>,
         font_size_pt: f64,
-        is_math: bool,
+        is_math: Option<&Bound<'_, PyAny>>,
         top_edge: &str,
         bottom_edge: &str,
     ) -> PyResult<Vec<(f64, f64, f64)>> {
@@ -447,6 +520,61 @@ mod tests {
         let src = Source::detached(format!("{MITEX_PRELUDE}\n#set text(size: 7pt)\n{converted}"));
         let metrics = world.measure_source(src).expect("measure kappa");
         println!("Metrics: {:?}", (metrics.width, metrics.height, metrics.descent));
+    }
+
+    #[test]
+    fn test_math_scope_keeps_prose_literal() {
+        let body = prepare_typst_body(
+            "Lattice Parameter $a$ (nm)",
+            TextMode::Mixed,
+        );
+        assert_eq!(body, "Lattice Parameter $a$ (nm)");
+
+        let body = prepare_typst_body(r"Nelson-Riley Function $f(\theta)$", TextMode::Mixed);
+        assert!(body.starts_with("Nelson-Riley Function "), "{body}");
+        assert!(!body.starts_with("$"), "prose must not enter math: {body}");
+        assert!(body.contains("theta"), "{body}");
+    }
+
+    #[test]
+    fn test_math_scope_tex_probe_stays_text() {
+        // Matplotlib probes renderers with `"lp"` and `ismath="TeX"`.
+        assert_eq!(prepare_typst_body("lp", TextMode::Tex), "lp");
+        assert_eq!(prepare_typst_body("tp", TextMode::Tex), "tp");
+        // Bare math source is only implied by the boolean mode.
+        assert!(prepare_typst_body(r"\lambda_B", TextMode::Mixed).starts_with('$'));
+        assert_eq!(prepare_typst_body(r"\lambda_B", TextMode::Tex), "\\lambda_B");
+    }
+
+    #[test]
+    fn test_plain_text_escapes_dollar() {
+        assert_eq!(prepare_typst_body("cost $5", TextMode::Plain), "cost \\$5");
+        assert_eq!(prepare_typst_body(r"cost \$5", TextMode::Plain), "cost \\$5");
+    }
+
+    #[test]
+    fn test_mixed_math_measures_prose_at_text_size() {
+        let world = MeasurerWorld::new(&[], false);
+        let prose_only = world
+            .measure_source(Source::detached(
+                "#set text(size: 10pt)\nLattice Parameter a (nm)",
+            ))
+            .expect("measure prose");
+        let mixed = world
+            .measure_source(Source::detached(format!(
+                "{MITEX_PRELUDE}#set text(size: 10pt)\n{}",
+                prepare_typst_body("Lattice Parameter $a$ (nm)", TextMode::Mixed)
+            )))
+            .expect("measure mixed");
+        // A single italic `a` must not blow the width up to whole-string math.
+        let delta = (mixed.width - prose_only.width).abs();
+        assert!(
+            delta < prose_only.width * 0.10,
+            "prose={} mixed={} delta={}",
+            prose_only.width,
+            mixed.width,
+            delta
+        );
     }
 
     #[test]
