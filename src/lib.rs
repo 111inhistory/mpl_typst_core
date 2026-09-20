@@ -14,12 +14,20 @@ use typst::introspection::{EmptyIntrospector, Locator};
 use typst::layout::{Abs, Axes, Frame, Region};
 use typst::syntax::{FileId, Source};
 use typst::text::{Font, FontBook};
-use typst::utils::{LazyHash, Protected};
+use typst::utils::{LazyHash, Protected, Scalar};
+use typst_kit::downloader::SystemDownloader;
+use typst_kit::files::{FileStore, FsRoot, SystemFiles};
 use typst_kit::fonts::FontStore;
+use typst_kit::packages::SystemPackages;
+use typst_layout::PagedDocument;
+use typst_pdf::PdfOptions;
+use typst_render::RenderOptions;
+use typst_svg::SvgOptions;
 
 struct MeasurerWorld {
     library: LazyHash<Library>,
     fonts: FontStore,
+    files: FileStore<SystemFiles>,
     source: RwLock<Source>,
 }
 
@@ -34,16 +42,26 @@ impl MeasurerWorld {
             fonts.extend(typst_kit::fonts::scan(path));
         }
 
+        let packages = SystemPackages::new(SystemDownloader::new("mpl-typst-core"));
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let files = FileStore::new(SystemFiles::new(FsRoot::new(project_root), packages));
+
         let default_source = Source::detached("");
         Self {
             library: LazyHash::new(Library::default()),
             fonts,
+            files,
             source: RwLock::new(default_source),
         }
     }
-
     fn set_source(&self, source: Source) {
         *self.source.write() = source;
+    }
+
+    fn compile_document(&self, source: Source) -> SourceResult<PagedDocument> {
+        self.set_source(source);
+        let warned = typst::compile::<PagedDocument>(self);
+        warned.output
     }
 }
 
@@ -65,17 +83,17 @@ impl World for MeasurerWorld {
         if id == current.id() {
             Ok(current.clone())
         } else {
-            Err(FileError::NotFound(id.vpath().get_without_slash().into()))
+            self.files.source(id)
         }
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
-        Err(FileError::NotFound(id.vpath().get_without_slash().into()))
+        self.files.file(id)
     }
-
     fn font(&self, index: usize) -> Option<Font> {
         self.fonts.font(index)
     }
+
 
     fn today(&self, _offset: Option<Duration>) -> Option<Datetime> {
         None
@@ -137,20 +155,36 @@ impl MeasurerWorld {
     }
 }
 
-#[pyclass]
-pub struct TypstCoreMeasurer {
-    world: MeasurerWorld,
-}
-
 const MITEX_PRELUDE: &str = "\
 #let textmath(it) = text(it)\n\
 #let mitexcolor(c, it) = text(fill: rgb(c), it)\n\
 #let mitexoverbrace(it) = overbrace(it)\n\
 #let mitexunderbrace(it) = underbrace(it)\n\
+#let planck = (reduce: symbol(\"ℏ\"))\n\
 ";
 
+fn strip_mathdefault(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find(r"\mathdefault{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 13..];
+        if let Some(end) = after.find('}') {
+            out.push_str(&after[..end]);
+            rest = &after[end + 1..];
+        } else {
+            out.push_str(after);
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn convert_latex_math(s: &str) -> String {
-    let trimmed = s.trim();
+    let stripped = strip_mathdefault(s);
+    let trimmed = stripped.trim();
     let inner = if trimmed.starts_with('$') && trimmed.ends_with('$') && trimmed.len() >= 2 {
         &trimmed[1..trimmed.len() - 1]
     } else {
@@ -163,10 +197,14 @@ fn convert_latex_math(s: &str) -> String {
     }
     format!("$ {} $", inner)
 }
-
 fn prepare_typst_body(text: &str, is_math: bool) -> String {
     if is_math {
-        convert_latex_math(text)
+        let trimmed = text.trim();
+        if trimmed.starts_with('$') || trimmed.contains('\\') {
+            convert_latex_math(text)
+        } else {
+            text.to_string()
+        }
     } else if text.contains('$') {
         let mut result = String::with_capacity(text.len() + 16);
         let mut in_math = false;
@@ -196,6 +234,11 @@ fn prepare_typst_body(text: &str, is_math: bool) -> String {
     }
 }
 
+#[pyclass]
+pub struct TypstCoreMeasurer {
+    world: MeasurerWorld,
+}
+
 #[pymethods]
 impl TypstCoreMeasurer {
     #[new]
@@ -223,8 +266,6 @@ impl TypstCoreMeasurer {
     }
 
     /// Helper tailored for Matplotlib text elements.
-    ///
-    /// Constructs styled Typst source with the given fonts, size, and body.
     #[pyo3(signature = (
         text,
         font_family=None,
@@ -260,10 +301,22 @@ impl TypstCoreMeasurer {
 
         let body = prepare_typst_body(text, is_math);
 
+        let top_edge_val = if top_edge.ends_with("pt") || top_edge.ends_with("em") {
+            top_edge.to_string()
+        } else {
+            format!("\"{top_edge}\"")
+        };
+
+        let bottom_edge_val = if bottom_edge.ends_with("pt") || bottom_edge.ends_with("em") {
+            bottom_edge.to_string()
+        } else {
+            format!("\"{bottom_edge}\"")
+        };
+
         let typst_code = format!(
             "{MITEX_PRELUDE}\
              #set par(leading: {par_leading_em}em, spacing: {par_spacing_em}em)\n\
-             #set text(font: {fonts_typst}, size: {font_size_pt}pt, top-edge: \"{top_edge}\", bottom-edge: \"{bottom_edge}\")\n\
+             #set text(font: {fonts_typst}, size: {font_size_pt}pt, top-edge: {top_edge_val}, bottom-edge: {bottom_edge_val})\n\
              {body}\n"
         );
 
@@ -304,6 +357,75 @@ impl TypstCoreMeasurer {
         }
         Ok(results)
     }
+
+    // ==========================================
+    // Full document compilation & export (replacing typst-py)
+    // ==========================================
+
+    /// Compiles a complete Typst source document into PDF bytes.
+    fn render_pdf(&self, source_code: &str) -> PyResult<Vec<u8>> {
+        let source = Source::detached(source_code);
+        let doc = self
+            .world
+            .compile_document(source)
+            .map_err(|errs| PyRuntimeError::new_err(format!("Typst PDF compile error: {errs:?}")))?;
+        let pdf_options = PdfOptions::default();
+        typst_pdf::pdf(&doc, &pdf_options)
+            .map_err(|errs| PyRuntimeError::new_err(format!("PDF export error: {errs:?}")))
+    }
+
+    /// Compiles a complete Typst source document into PNG image bytes.
+    #[pyo3(signature = (source_code, ppi=None))]
+    fn render_png(&self, source_code: &str, ppi: Option<f32>) -> PyResult<Vec<u8>> {
+        let source = Source::detached(source_code);
+        let doc = self
+            .world
+            .compile_document(source)
+            .map_err(|errs| PyRuntimeError::new_err(format!("Typst PNG compile error: {errs:?}")))?;
+        let ppi_val = ppi.unwrap_or(144.0);
+        let pixel_per_pt = (ppi_val / 72.0) as f64;
+        let render_options = RenderOptions {
+            pixel_per_pt: Scalar::new(pixel_per_pt),
+            render_bleed: false,
+        };
+        let pixmap = typst_render::render_merged(&doc, &render_options, Abs::zero(), None);
+        pixmap
+            .encode_png()
+            .map_err(|err| PyRuntimeError::new_err(format!("PNG encode error: {err}")))
+    }
+
+    /// Compiles a complete Typst source document into an SVG string.
+    fn render_svg(&self, source_code: &str) -> PyResult<String> {
+        let source = Source::detached(source_code);
+        let doc = self
+            .world
+            .compile_document(source)
+            .map_err(|errs| PyRuntimeError::new_err(format!("Typst SVG compile error: {errs:?}")))?;
+        let svg_options = SvgOptions::default();
+        Ok(typst_svg::svg_merged(&doc, &svg_options, Abs::zero()))
+    }
+
+    /// Compiles Typst source directly to a PDF file on disk.
+    fn compile_pdf(&self, source_code: &str, output_path: &str) -> PyResult<()> {
+        let bytes = self.render_pdf(source_code)?;
+        std::fs::write(output_path, bytes)
+            .map_err(|err| PyRuntimeError::new_err(format!("Failed to write PDF: {err}")))
+    }
+
+    /// Compiles Typst source directly to a PNG file on disk.
+    #[pyo3(signature = (source_code, output_path, ppi=None))]
+    fn compile_png(&self, source_code: &str, output_path: &str, ppi: Option<f32>) -> PyResult<()> {
+        let bytes = self.render_png(source_code, ppi)?;
+        std::fs::write(output_path, bytes)
+            .map_err(|err| PyRuntimeError::new_err(format!("Failed to write PNG: {err}")))
+    }
+
+    /// Compiles Typst source directly to an SVG file on disk.
+    fn compile_svg(&self, source_code: &str, output_path: &str) -> PyResult<()> {
+        let svg_str = self.render_svg(source_code)?;
+        std::fs::write(output_path, svg_str)
+            .map_err(|err| PyRuntimeError::new_err(format!("Failed to write SVG: {err}")))
+    }
 }
 
 #[pymodule]
@@ -317,6 +439,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_kappa_hbar() {
+        let text = r"\kappa = pa/\hbar";
+        let world = MeasurerWorld::new(&[], false);
+        let converted = convert_latex_math(text);
+        println!("Converted kappa: {}", converted);
+        let src = Source::detached(format!("{MITEX_PRELUDE}\n#set text(size: 7pt)\n{converted}"));
+        let metrics = world.measure_source(src).expect("measure kappa");
+        println!("Metrics: {:?}", (metrics.width, metrics.height, metrics.descent));
+    }
+
+    #[test]
     fn test_native_measure_text() {
         let world = MeasurerWorld::new(&[], false);
         let src = Source::detached(
@@ -324,10 +457,6 @@ mod tests {
              Hello World",
         );
         let metrics = world.measure_source(src).expect("should measure text");
-        println!(
-            "Width: {}, Height: {}, Descent: {}",
-            metrics.width, metrics.height, metrics.descent
-        );
         assert!(metrics.width > 0.0);
         assert!(metrics.height > 0.0);
     }
@@ -340,13 +469,10 @@ mod tests {
              $E = m c^2$",
         );
         let metrics = world.measure_source(src).expect("should measure math");
-        println!(
-            "Math Width: {}, Height: {}, Descent: {}",
-            metrics.width, metrics.height, metrics.descent
-        );
         assert!(metrics.width > 0.0);
         assert!(metrics.height > 0.0);
     }
+
     #[test]
     fn test_native_measure_math_fraction() {
         let world = MeasurerWorld::new(&[], false);
@@ -355,14 +481,11 @@ mod tests {
              $y = (x_1) / (x_2)$",
         );
         let metrics = world.measure_source(src).expect("should measure math fraction");
-        println!(
-            "Fraction Math Width: {}, Height: {}, Descent: {}",
-            metrics.width, metrics.height, metrics.descent
-        );
         assert!(metrics.width > 0.0);
         assert!(metrics.height > 0.0);
         assert!(metrics.descent > 0.0, "fraction denominator must have descent!");
     }
+
     #[test]
     fn test_native_measure_descender() {
         let world = MeasurerWorld::new(&[], false);
@@ -371,10 +494,6 @@ mod tests {
              typography with g, j, p, q, y",
         );
         let metrics = world.measure_source(src).expect("should measure descender");
-        println!(
-            "Descender Width: {}, Height: {}, Descent: {}",
-            metrics.width, metrics.height, metrics.descent
-        );
         assert!(metrics.width > 0.0);
         assert!(metrics.height > 0.0);
         assert!(metrics.descent > 0.0, "descent must be positive for descenders!");
@@ -390,7 +509,36 @@ mod tests {
             typst_math
         ));
         let metrics = world.measure_source(src).expect("measure mitex math");
-        println!("MiTeX Math Width: {}, Height: {}, Descent: {}", metrics.width, metrics.height, metrics.descent);
         assert!(metrics.width > 0.0);
+    }
+
+    #[test]
+    fn test_native_export_pdf_png_svg() {
+        let world = MeasurerWorld::new(&[], false);
+        let src = Source::detached(
+            "#set page(width: 100pt, height: 100pt, margin: 10pt)\n\
+             #set text(size: 10pt)\n\
+             Hello Native Typst Export!",
+        );
+        let doc = world.compile_document(src).expect("compile doc");
+
+        // PDF
+        let pdf_bytes = typst_pdf::pdf(&doc, &PdfOptions::default()).expect("pdf export");
+        assert!(!pdf_bytes.is_empty());
+        assert_eq!(&pdf_bytes[0..4], b"%PDF");
+
+        // SVG
+        let svg_str = typst_svg::svg_merged(&doc, &SvgOptions::default(), Abs::zero());
+        assert!(svg_str.contains("<svg"));
+
+        // PNG
+        let render_options = RenderOptions {
+            pixel_per_pt: Scalar::new(2.0),
+            render_bleed: false,
+        };
+        let pixmap = typst_render::render_merged(&doc, &render_options, Abs::zero(), None);
+        let png_bytes = pixmap.encode_png().expect("png encode");
+        assert!(!png_bytes.is_empty());
+        assert_eq!(&png_bytes[1..4], b"PNG");
     }
 }
