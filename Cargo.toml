@@ -2,6 +2,10 @@
 name = "mpl-typst-core"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Native Rust core extension for Matplotlib Typst backend"
+readme = "README.md"
+repository = "https://github.com/111inhistory/mpl_typst_core"
 
 [lib]
 name = "mpl_typst_core"
@@ -11,14 +15,14 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"] }
 parking_lot = "0.12"
 mitex = "0.2.4"
-typst = { path = "typst/crates/typst" }
-typst-kit = { path = "typst/crates/typst-kit", features = ["scan-fonts", "embedded-fonts", "system-files", "system-packages", "system-downloader"] }
-typst-library = { path = "typst/crates/typst-library" }
-typst-eval = { path = "typst/crates/typst-eval" }
-typst-syntax = { path = "typst/crates/typst-syntax" }
-typst-layout = { path = "typst/crates/typst-layout" }
-typst-pdf = { path = "typst/crates/typst-pdf" }
-typst-render = { path = "typst/crates/typst-render" }
-typst-svg = { path = "typst/crates/typst-svg" }
+typst = "0.15.1"
+typst-kit = { version = "0.15.1", features = ["scan-fonts", "embedded-fonts", "system-files", "system-packages", "system-downloader"] }
+typst-library = "0.15.1"
+typst-eval = "0.15.1"
+typst-syntax = "0.15.1"
+typst-layout = "0.15.1"
+typst-pdf = "0.15.1"
+typst-render = "0.15.1"
+typst-svg = "0.15.1"
 ecow = "0.2"
 comemo = "0.5"

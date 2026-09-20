@@ -1,3 +1,4 @@
 /target
 /.venv
 *.whl
+tests_output/
