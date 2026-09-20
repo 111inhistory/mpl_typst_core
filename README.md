@@ -62,6 +62,14 @@ contract, so plain text never leaks into the math parser:
 Inline math is emitted tightly (`$x$`), because Typst treats the
 whitespace-padded form (`$ x $`) as display math and lays it out as a block.
 
+### `top_edge` / `bottom_edge`
+
+Both parameters accept a Typst length (`1em`, `12pt`, `2mm`) or an edge metric
+(`cap-height`, `ascender`, `x-height`, `baseline`, `bounds`, `descender`).
+Lengths are emitted verbatim; metric names are quoted, because an unquoted
+metric name is parsed as a variable reference and fails with
+"unknown variable".
+
 ## License
 
 MIT License.

@@ -211,6 +211,31 @@ fn strip_mathdefault(s: &str) -> String {
     out
 }
 
+/// Typst lengths are the only `text` edge values that may be written unquoted.
+fn is_length_code(value: &str) -> bool {
+    const UNITS: [&str; 7] = ["pt", "mm", "cm", "in", "rem", "em", "%"];
+    let value = value.trim();
+    UNITS.iter().any(|unit| {
+        value
+            .strip_suffix(unit)
+            .is_some_and(|number| !number.is_empty() && number.parse::<f64>().is_ok())
+    })
+}
+
+/// Typst code for a `text` edge (`top-edge` / `bottom-edge`).
+///
+/// Lengths such as `1em` are emitted verbatim; metric names such as
+/// `cap-height` are quoted, because an unquoted metric name is parsed as a
+/// variable reference and fails with "unknown variable".
+fn edge_code(value: &str) -> String {
+    let value = value.trim();
+    if is_length_code(value) {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
+}
+
 /// Renders one Matplotlib math fragment as Typst inline math.
 fn convert_latex_math(inner: &str) -> String {
     let stripped = strip_mathdefault(inner);
@@ -374,17 +399,8 @@ impl TypstCoreMeasurer {
 
         let body = prepare_typst_body(text, TextMode::from_py(is_math));
 
-        let top_edge_val = if top_edge.ends_with("pt") || top_edge.ends_with("em") {
-            top_edge.to_string()
-        } else {
-            format!("\"{top_edge}\"")
-        };
-
-        let bottom_edge_val = if bottom_edge.ends_with("pt") || bottom_edge.ends_with("em") {
-            bottom_edge.to_string()
-        } else {
-            format!("\"{bottom_edge}\"")
-        };
+        let top_edge_val = edge_code(top_edge);
+        let bottom_edge_val = edge_code(bottom_edge);
 
         let typst_code = format!(
             "{MITEX_PRELUDE}\
@@ -575,6 +591,36 @@ mod tests {
             mixed.width,
             delta
         );
+    }
+
+    #[test]
+    fn test_edge_code_quotes_metrics_only() {
+        assert_eq!(edge_code("cap-height"), "\"cap-height\"");
+        assert_eq!(edge_code("descender"), "\"descender\"");
+        assert_eq!(edge_code("baseline"), "\"baseline\"");
+        assert_eq!(edge_code("1em"), "1em");
+        assert_eq!(edge_code(" 0.8em "), "0.8em");
+        assert_eq!(edge_code("12pt"), "12pt");
+        assert_eq!(edge_code("2mm"), "2mm");
+        assert_eq!(edge_code("1rem"), "1rem");
+    }
+
+    #[test]
+    fn test_cap_height_edges_measure() {
+        let world = MeasurerWorld::new(&[], false);
+        let quoted = world
+            .measure_source(Source::detached(
+                "#set text(size: 10pt, top-edge: \"cap-height\", bottom-edge: \"baseline\")\nHello World",
+            ))
+            .expect("measure with metric edges");
+        let raw = world
+            .measure_source(Source::detached(
+                "#set text(size: 10pt, top-edge: 1em, bottom-edge: \"baseline\")\nHello World",
+            ))
+            .expect("measure with 1em top edge");
+        assert!(quoted.width > 0.0);
+        // cap-height is strictly shorter than the 1em box.
+        assert!(quoted.height < raw.height);
     }
 
     #[test]
