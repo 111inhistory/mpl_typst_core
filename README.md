@@ -34,21 +34,33 @@ w, h, d = measurer.measure_text(
     "Sample text",
     font_family=["Times New Roman", "SimSun"],
     font_size_pt=7.0,
-    is_math=False
 )
 
-# 2. LaTeX math equation measurement
-w, h, d = measurer.measure_text(
-    r"\lambda_B / \text{nm}",
-    font_size_pt=7.0,
-    is_math=True
-)
+# 2. Mixed prose and math, exactly as Matplotlib emits it
+w, h, d = measurer.measure_text("Lattice Parameter $a$ (nm)", is_math=True)
 
-# 3. Document export
+# 3. Bare LaTeX math source
+w, h, d = measurer.measure_text(r"\lambda_B / \text{nm}", is_math=True)
+
+# 4. Document export
 measurer.compile_pdf(typst_source, "output.pdf")
 measurer.compile_png(typst_source, "output.png", ppi=300.0)
 measurer.compile_svg(typst_source, "output.svg")
 ```
+
+### `is_math` semantics
+
+`is_math` mirrors Matplotlib's `RendererBase.get_text_width_height_descent`
+contract, so plain text never leaks into the math parser:
+
+| `is_math` | Meaning |
+| --- | --- |
+| `False` (default) | The whole string is literal text; `$` is escaped for Typst. |
+| `True` | Prose interleaved with `$...$` math spans; only those spans are converted. A string without any `$` is treated as bare math source. |
+| `"TeX"` | As `True`, except a string without `$` stays literal — Matplotlib probes renderers with `"lp"` under `text.usetex`. |
+
+Inline math is emitted tightly (`$x$`), because Typst treats the
+whitespace-padded form (`$ x $`) as display math and lays it out as a block.
 
 ## License
 
