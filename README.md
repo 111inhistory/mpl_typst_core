@@ -48,6 +48,24 @@ measurer.compile_png(typst_source, "output.png", ppi=300.0)
 measurer.compile_svg(typst_source, "output.svg")
 ```
 
+### PDF output is untagged by default
+
+Typst writes a tagged PDF unless `tagged=False`: an accessibility structure
+tree (`/StructTreeRoot`, a `/StructElem` per text span and per formula, and a
+parent-tree array) plus marked-content operators inside the content streams.
+A figure is embedded as an image by whatever document consumes it, so none of
+that ever reaches a reader — it is pure overhead, emitted as many small
+*uncompressed* objects with one xref entry each.
+
+Measured on a 6.5×4.2 in figure with 400 math+CJK labels: 243.5 KB tagged
+(842 objects) vs 68.4 KB untagged (27 objects); the structure tree alone is 830
+objects taking 135.0 KB, identical on Linux and Windows. The cost tracks the
+number of text runs, so a text-dense figure drops ~72% while an ordinary
+line-plot figure drops only ~3% (103.0 KB → 100.0 KB).
+
+Pass `tagged=True` to `render_pdf` / `compile_pdf` for a standalone document
+that should be accessible on its own.
+
 ### `is_math` semantics
 
 `is_math` mirrors Matplotlib's `RendererBase.get_text_width_height_descent`

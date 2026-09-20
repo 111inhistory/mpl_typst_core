@@ -452,13 +452,22 @@ impl TypstCoreMeasurer {
     // ==========================================
 
     /// Compiles a complete Typst source document into PDF bytes.
-    fn render_pdf(&self, source_code: &str) -> PyResult<Vec<u8>> {
+    ///
+    /// `tagged` selects Typst's PDF accessibility structure tree. It defaults
+    /// to `false`: a figure is embedded as an image by whatever document
+    /// consumes it, so the tree (one object per text span, uncompressed) is
+    /// only ever dead weight. Pass `True` for a standalone accessible document.
+    #[pyo3(signature = (source_code, tagged = false))]
+    fn render_pdf(&self, source_code: &str, tagged: bool) -> PyResult<Vec<u8>> {
         let source = Source::detached(source_code);
         let doc = self
             .world
             .compile_document(source)
             .map_err(|errs| PyRuntimeError::new_err(format!("Typst PDF compile error: {errs:?}")))?;
-        let pdf_options = PdfOptions::default();
+        let pdf_options = PdfOptions {
+            tagged,
+            ..Default::default()
+        };
         typst_pdf::pdf(&doc, &pdf_options)
             .map_err(|errs| PyRuntimeError::new_err(format!("PDF export error: {errs:?}")))
     }
@@ -495,8 +504,9 @@ impl TypstCoreMeasurer {
     }
 
     /// Compiles Typst source directly to a PDF file on disk.
-    fn compile_pdf(&self, source_code: &str, output_path: &str) -> PyResult<()> {
-        let bytes = self.render_pdf(source_code)?;
+    #[pyo3(signature = (source_code, output_path, tagged = false))]
+    fn compile_pdf(&self, source_code: &str, output_path: &str, tagged: bool) -> PyResult<()> {
+        let bytes = self.render_pdf(source_code, tagged)?;
         std::fs::write(output_path, bytes)
             .map_err(|err| PyRuntimeError::new_err(format!("Failed to write PDF: {err}")))
     }

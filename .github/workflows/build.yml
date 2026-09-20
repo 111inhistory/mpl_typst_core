@@ -63,7 +63,25 @@ jobs:
         run: |
           python3 -m venv /tmp/smoke
           /tmp/smoke/bin/pip install --quiet dist/*.whl
-          /tmp/smoke/bin/python -c "import mpl_typst_core; print(mpl_typst_core.TypstCoreMeasurer(include_system_fonts=False).measure_text('Hello'))"
+          /tmp/smoke/bin/python - <<'PY'
+          import mpl_typst_core
+
+          measurer = mpl_typst_core.TypstCoreMeasurer(include_system_fonts=False)
+          print("measure:", measurer.measure_text("Hello"))
+
+          source = "#set page(width: 100pt, height: 100pt)\nHello Tagged World!"
+          measurer.compile_pdf(source, "default.pdf")
+          measurer.compile_pdf(source, "tagged.pdf", tagged=True)
+          default = open("default.pdf", "rb").read()
+          tagged = open("tagged.pdf", "rb").read()
+
+          # Typst tags PDFs by default; the structure tree is dead weight for a
+          # figure, so the core opts out and keeps it behind the flag.
+          assert b"/StructElem" not in default, "PDF tagging must be opt-in"
+          assert b"/StructElem" in tagged
+          assert len(default) < len(tagged), (len(default), len(tagged))
+          print(f"pdf: default={len(default)}B tagged={len(tagged)}B")
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.target }}
