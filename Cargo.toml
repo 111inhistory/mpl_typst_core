@@ -1,0 +1,21 @@
+[package]
+name = "mpl-typst-core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mpl_typst_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.24", features = ["extension-module", "abi3-py310"] }
+parking_lot = "0.12"
+mitex = "0.2.4"
+typst = { path = "typst/crates/typst" }
+typst-kit = { path = "typst/crates/typst-kit", features = ["scan-fonts", "embedded-fonts"] }
+typst-library = { path = "typst/crates/typst-library" }
+typst-eval = { path = "typst/crates/typst-eval" }
+typst-syntax = { path = "typst/crates/typst-syntax" }
+typst-layout = { path = "typst/crates/typst-layout" }
+ecow = "0.2"
+comemo = "0.5"
