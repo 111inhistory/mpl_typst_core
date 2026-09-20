@@ -29,11 +29,17 @@ jobs:
 
   linux:
     name: linux ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    # aarch64 runs natively; cross-compiling it under QEMU takes an order of
+    # magnitude longer for identical output.
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - name: Build wheel
@@ -41,6 +47,16 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: "2_28"
+          # `--features vendor-openssl` makes `openssl-src` configure and build
+          # OpenSSL from source, which needs the full Perl distribution; the
+          # manylinux images only carry a subset. Same recipe as `typst-py`,
+          # which vendors OpenSSL the same way.
+          before-script-linux: |
+            if which yum >/dev/null 2>&1; then
+              yum install -y perl-core perl-IPC-Cmd || yum install -y perl-core || true
+            elif which apt-get >/dev/null 2>&1; then
+              apt-get update && apt-get install -y perl libtext-template-perl || true
+            fi
           args: --release --out dist --features vendor-openssl
       - name: Smoke test the wheel
         if: matrix.target == 'x86_64'
